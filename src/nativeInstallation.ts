@@ -233,14 +233,16 @@ function parseStringPointer(buffer: Buffer, offset: number): StringPointer {
 /**
  * True if the module represents the native claude entrypoint.
  */
-function isClaudeModule(moduleName: string): boolean {
+export function isClaudeModule(moduleName: string): boolean {
   return (
     moduleName.endsWith('/claude') ||
     moduleName === 'claude' ||
     moduleName.endsWith('/claude.exe') ||
     moduleName === 'claude.exe' ||
     moduleName.endsWith('/src/entrypoints/cli.js') ||
-    moduleName === 'src/entrypoints/cli.js'
+    moduleName === 'src/entrypoints/cli.js' ||
+    moduleName.endsWith('/cli') ||
+    moduleName === 'cli'
   );
 }
 
