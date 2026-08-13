@@ -6,7 +6,7 @@
 
 [![npm](https://img.shields.io/npm/v/tweakcc-fixed?color=cb3837&label=npm&logo=npm&style=flat-square)](https://www.npmjs.com/package/tweakcc-fixed)
 [![downloads](https://img.shields.io/npm/dt/tweakcc-fixed?color=cb3837&style=flat-square)](https://www.npmjs.com/package/tweakcc-fixed)
-[![Claude Code](https://img.shields.io/badge/Claude%20Code-2.0.98%20%E2%86%92%202.1.228-d97757?style=flat-square)](https://github.com/anthropics/claude-code)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-2.0.98%20%E2%86%92%202.1.229-d97757?style=flat-square)](https://github.com/anthropics/claude-code)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](#credit--license)
 
 **[Install](#install) · [Customize](#what-you-can-customize) · [The fork](#what-this-fork-adds) · [How it works](#how-it-works)**
@@ -14,6 +14,10 @@
 </div>
 
 ---
+
+> This repository is the Clodex-maintained distribution of `tweakcc-fixed`.
+> Clodex pins immutable release artifacts from this fork so its Claude Code
+> patcher does not depend on unmerged upstream fixes or local package patches.
 
 Claude Code only exposes so much through its settings. tweakcc reaches the rest: it patches the installed binary directly — the `cli.js`, and the JavaScript baked into the native Bun build — so you can restyle the interface, rewrite the prompts Claude actually runs on, and change how it behaves. You pick what you want from a terminal UI, apply it in one command, and roll it back whenever you like.
 
