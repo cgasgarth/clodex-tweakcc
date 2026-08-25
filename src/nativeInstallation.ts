@@ -313,6 +313,93 @@ function mapModules<T>(
   return undefined;
 }
 
+const NATIVE_MODULE_MARKER_PREFIX = Buffer.from('\0/*tweakcc-module:');
+const NATIVE_MODULE_MARKER_SUFFIX = Buffer.from('*/\0');
+
+interface NativeModuleSource {
+  index: number;
+  content: Buffer;
+}
+
+function isUtf8Source(content: Buffer): boolean {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(content);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function joinNativeModuleSources(modules: NativeModuleSource[]): Buffer {
+  const parts: Buffer[] = [];
+  for (const module of modules) {
+    if (!Number.isSafeInteger(module.index) || module.index < 0) {
+      throw new Error(`Invalid native module index: ${module.index}`);
+    }
+    if (module.content.indexOf(NATIVE_MODULE_MARKER_PREFIX) !== -1) {
+      throw new Error(
+        `Native module ${module.index} contains the module boundary marker`
+      );
+    }
+    parts.push(
+      Buffer.from(`\0/*tweakcc-module:${module.index}*/\0`),
+      module.content
+    );
+  }
+  return Buffer.concat(parts);
+}
+
+export function splitNativeModuleSources(
+  aggregate: Buffer
+): Map<number, Buffer> | null {
+  if (
+    !aggregate
+      .subarray(0, NATIVE_MODULE_MARKER_PREFIX.length)
+      .equals(NATIVE_MODULE_MARKER_PREFIX)
+  ) {
+    return null;
+  }
+
+  const modules = new Map<number, Buffer>();
+  let cursor = 0;
+  while (cursor < aggregate.length) {
+    if (
+      !aggregate
+        .subarray(cursor, cursor + NATIVE_MODULE_MARKER_PREFIX.length)
+        .equals(NATIVE_MODULE_MARKER_PREFIX)
+    ) {
+      throw new Error(`Invalid native module boundary at byte ${cursor}`);
+    }
+    const indexStart = cursor + NATIVE_MODULE_MARKER_PREFIX.length;
+    const markerEnd = aggregate.indexOf(
+      NATIVE_MODULE_MARKER_SUFFIX,
+      indexStart
+    );
+    if (markerEnd === -1) {
+      throw new Error(`Unterminated native module boundary at byte ${cursor}`);
+    }
+    const indexText = aggregate
+      .subarray(indexStart, markerEnd)
+      .toString('ascii');
+    if (!/^\d+$/.test(indexText)) {
+      throw new Error(`Invalid native module index: ${indexText}`);
+    }
+    const index = Number(indexText);
+    if (!Number.isSafeInteger(index) || modules.has(index)) {
+      throw new Error(`Duplicate or invalid native module index: ${indexText}`);
+    }
+    const contentStart = markerEnd + NATIVE_MODULE_MARKER_SUFFIX.length;
+    const nextMarker = aggregate.indexOf(
+      NATIVE_MODULE_MARKER_PREFIX,
+      contentStart
+    );
+    const contentEnd = nextMarker === -1 ? aggregate.length : nextMarker;
+    modules.set(index, aggregate.subarray(contentStart, contentEnd));
+    cursor = contentEnd;
+  }
+  return modules;
+}
+
 function parseOffsets(buffer: Buffer): BunOffsets {
   let pos = 0;
   const byteCount = buffer.readBigUInt64LE(pos);
@@ -865,7 +952,9 @@ export function extractClaudeJsFromNativeInstallation(
       `extractClaudeJsFromNativeInstallation: Got bunData, size=${bunData.length} bytes, moduleStructSize=${moduleStructSize}`
     );
 
-    const result = mapModules(
+    const entryModule: { content?: Buffer } = {};
+    const sourceModules: NativeModuleSource[] = [];
+    mapModules(
       bunData,
       bunOffsets,
       moduleStructSize,
@@ -874,22 +963,37 @@ export function extractClaudeJsFromNativeInstallation(
           `extractClaudeJsFromNativeInstallation: Module ${index}: ${moduleName}`
         );
 
-        if (!isClaudeModule(moduleName)) return undefined;
-
         const moduleContents = getStringPointerContent(
           bunData,
           module.contents
         );
 
+        if (moduleContents.length > 0 && isUtf8Source(moduleContents)) {
+          sourceModules.push({ index, content: moduleContents });
+        }
+
+        if (!isClaudeModule(moduleName)) return undefined;
+
         debug(
           `extractClaudeJsFromNativeInstallation: Found claude module, contents length=${moduleContents.length}`
         );
 
-        return moduleContents.length > 0 ? moduleContents : undefined;
+        if (moduleContents.length > 0) entryModule.content = moduleContents;
+        return undefined;
       }
     );
 
+    const result = entryModule.content;
     if (result) {
+      if (result.includes('/$bunfs/root/chunk-')) {
+        debug(
+          `extractClaudeJsFromNativeInstallation: Found split bundle with ${sourceModules.length} readable modules`
+        );
+        return {
+          data: joinNativeModuleSources(sourceModules),
+          clearBytecode: true,
+        };
+      }
       const head = result.subarray(0, 64).toString('utf8');
       // Only ACTUAL bytecode (no @bun-cjs source marker) should fall back to
       // fetching npm source. Modern CC ships the claude module as readable
@@ -959,6 +1063,10 @@ function rebuildBunData(
   moduleStructSize: number,
   clearBytecode: boolean
 ): Buffer {
+  const moduleUpdates = modifiedClaudeJs
+    ? splitNativeModuleSources(modifiedClaudeJs)
+    : null;
+  const appliedModuleUpdates = new Set<number>();
   // Phase 1: Collect all string data
   const stringsData: Buffer[] = [];
   const modulesMetadata: Array<{
@@ -975,56 +1083,93 @@ function rebuildBunData(
   }> = [];
 
   // Use mapModules to iterate and collect module data
-  mapModules(bunData, bunOffsets, moduleStructSize, (module, moduleName) => {
-    const nameBytes = getStringPointerContent(bunData, module.name);
-
-    // Check if this is claude.js and we have modified contents
-    let contentsBytes: Buffer;
-    let bytecodeBytes: Buffer;
-    if (modifiedClaudeJs && isClaudeModule(moduleName)) {
-      contentsBytes = modifiedClaudeJs;
-      bytecodeBytes = clearBytecode
-        ? Buffer.alloc(0)
-        : getStringPointerContent(bunData, module.bytecode);
-    } else {
-      contentsBytes = getStringPointerContent(bunData, module.contents);
-      bytecodeBytes = getStringPointerContent(bunData, module.bytecode);
-    }
-
-    const sourcemapBytes = getStringPointerContent(bunData, module.sourcemap);
-    const moduleInfoBytes = getStringPointerContent(bunData, module.moduleInfo);
-    const bytecodeOriginPathBytes = getStringPointerContent(
-      bunData,
-      module.bytecodeOriginPath
-    );
-
-    modulesMetadata.push({
-      name: nameBytes,
-      contents: contentsBytes,
-      sourcemap: sourcemapBytes,
-      bytecode: bytecodeBytes,
-      moduleInfo: moduleInfoBytes,
-      bytecodeOriginPath: bytecodeOriginPathBytes,
-      encoding: module.encoding,
-      loader: module.loader,
-      moduleFormat: module.moduleFormat,
-      side: module.side,
-    });
-
-    if (moduleStructSize === SIZEOF_MODULE_NEW) {
-      stringsData.push(
-        nameBytes,
-        contentsBytes,
-        sourcemapBytes,
-        bytecodeBytes,
-        moduleInfoBytes,
-        bytecodeOriginPathBytes
+  mapModules(
+    bunData,
+    bunOffsets,
+    moduleStructSize,
+    (module, moduleName, index) => {
+      const nameBytes = getStringPointerContent(bunData, module.name);
+      const originalContents = getStringPointerContent(
+        bunData,
+        module.contents
       );
-    } else {
-      stringsData.push(nameBytes, contentsBytes, sourcemapBytes, bytecodeBytes);
+      const moduleUpdate = moduleUpdates?.get(index);
+      if (moduleUpdate !== undefined) appliedModuleUpdates.add(index);
+
+      // Check if this is claude.js and we have modified contents
+      let contentsBytes: Buffer;
+      let bytecodeBytes: Buffer;
+      if (moduleUpdate !== undefined) {
+        contentsBytes = moduleUpdate;
+        bytecodeBytes = moduleUpdate.equals(originalContents)
+          ? getStringPointerContent(bunData, module.bytecode)
+          : Buffer.alloc(0);
+      } else if (
+        modifiedClaudeJs &&
+        moduleUpdates === null &&
+        isClaudeModule(moduleName)
+      ) {
+        contentsBytes = modifiedClaudeJs;
+        bytecodeBytes = clearBytecode
+          ? Buffer.alloc(0)
+          : getStringPointerContent(bunData, module.bytecode);
+      } else {
+        contentsBytes = originalContents;
+        bytecodeBytes = getStringPointerContent(bunData, module.bytecode);
+      }
+
+      const sourcemapBytes = getStringPointerContent(bunData, module.sourcemap);
+      const moduleInfoBytes = getStringPointerContent(
+        bunData,
+        module.moduleInfo
+      );
+      const bytecodeOriginPathBytes = getStringPointerContent(
+        bunData,
+        module.bytecodeOriginPath
+      );
+
+      modulesMetadata.push({
+        name: nameBytes,
+        contents: contentsBytes,
+        sourcemap: sourcemapBytes,
+        bytecode: bytecodeBytes,
+        moduleInfo: moduleInfoBytes,
+        bytecodeOriginPath: bytecodeOriginPathBytes,
+        encoding: module.encoding,
+        loader: module.loader,
+        moduleFormat: module.moduleFormat,
+        side: module.side,
+      });
+
+      if (moduleStructSize === SIZEOF_MODULE_NEW) {
+        stringsData.push(
+          nameBytes,
+          contentsBytes,
+          sourcemapBytes,
+          bytecodeBytes,
+          moduleInfoBytes,
+          bytecodeOriginPathBytes
+        );
+      } else {
+        stringsData.push(
+          nameBytes,
+          contentsBytes,
+          sourcemapBytes,
+          bytecodeBytes
+        );
+      }
+      return undefined;
     }
-    return undefined;
-  });
+  );
+
+  if (moduleUpdates && appliedModuleUpdates.size !== moduleUpdates.size) {
+    const missing = [...moduleUpdates.keys()].filter(
+      index => !appliedModuleUpdates.has(index)
+    );
+    throw new Error(
+      `Native module updates reference missing indices: ${missing.join(', ')}`
+    );
+  }
 
   const stringsPerModule = moduleStructSize === SIZEOF_MODULE_NEW ? 6 : 4;
 
